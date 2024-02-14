@@ -213,7 +213,7 @@ func main() {
 	setupWebhooks(mgr)
 
 	// +kubebuilder:scaffold:builder
-	setupLog.Info("starting manager")
+	setupLog.Info("starting manager <<<<< mer 14 feb 2024, 13:37:13, CET")
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
