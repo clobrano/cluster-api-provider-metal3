@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -26,8 +27,10 @@ import (
 	"github.com/metal3-io/cluster-api-provider-metal3/baremetal"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/discovery"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -43,6 +46,8 @@ type Metal3RemediationReconciler struct {
 	Log            logr.Logger
 }
 
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;delete;deletecollection
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch;update;delete;deletecollection
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=metal3remediations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=metal3remediations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status,verbs=get;list;watch;create;update;patch;delete
@@ -206,17 +211,30 @@ func (r *Metal3RemediationReconciler) reconcileNormal(ctx context.Context,
 			// Restore node if available and not done yet
 			if remediationMgr.HasFinalizer() {
 				if node != nil {
-					// Node was recreated, restore annotations and labels
-					r.Log.Info("Restoring the node")
-					if err := r.restoreNode(ctx, remediationMgr, clusterClient, node); err != nil {
-						return ctrl.Result{}, err
-					}
+					if isOutOfServiceTaintSupported(r.Log) {
+						// remove out-of-service taint
+						r.Log.Info("REMOVING OOST")
+						if err := remediationMgr.RemoveOutOfServiceTaint(ctx, clusterClient, node); err != nil {
+							r.Log.Error(err, "error removing out-of-service taint from node")
+							return ctrl.Result{}, errors.Wrap(err, "error removing out-of-service taint from node")
+						}
+						// clean up
+						r.Log.Info("Remediation done, cleaning up remediation CR")
+						remediationMgr.UnsetFinalizer()
+						return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+					} else {
+						// Node was recreated, restore annotations and labels
+						r.Log.Info("Restoring the node")
+						if err := r.restoreNode(ctx, remediationMgr, clusterClient, node); err != nil {
+							return ctrl.Result{}, err
+						}
 
-					// clean up
-					r.Log.Info("Remediation done, cleaning up remediation CR")
-					remediationMgr.RemoveNodeBackupAnnotations()
-					remediationMgr.UnsetFinalizer()
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+						// clean up
+						r.Log.Info("Remediation done, cleaning up remediation CR")
+						remediationMgr.RemoveNodeBackupAnnotations()
+						remediationMgr.UnsetFinalizer()
+						return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+					}
 				} else if isNodeForbidden {
 					// we don't have a node, just remove finalizer
 					remediationMgr.UnsetFinalizer()
@@ -282,6 +300,36 @@ func (r *Metal3RemediationReconciler) reconcileNormal(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
+func isOutOfServiceTaintSupported(log logr.Logger) bool {
+	if config, err := ctrl.GetConfig(); err != nil {
+		log.Error(err, "could not get config to get Server version")
+	} else {
+		if c, err := discovery.NewDiscoveryClientForConfig(config); err != nil {
+			log.Error(err, "could not get discovery client to get Server version")
+		} else {
+			if version, err := c.ServerVersion(); err != nil {
+				log.Error(err, "could not get Server version")
+			} else {
+				log.Info("Server version", "version", version.String(), "git version", version.GitVersion, "Minor", version.Minor, "Major", version.Major)
+				// convert into int
+				major, err := strconv.Atoi(version.Major)
+				if err != nil {
+					log.Error(err, "could not convert Major version to int", "major", version.Major)
+					return false
+				}
+				minor, err := strconv.Atoi(version.Minor)
+				if err != nil {
+					log.Error(err, "could not convert Minor version to int", "minor", version.Minor)
+					return false
+				}
+				log.Info("out of service support check", "supported", major > 1 || (major == 1 && minor >= 28))
+				return major > 1 || (major == 1 && minor >= 28)
+			}
+		}
+	}
+	return false
+}
+
 // remediateRebootStrategy executes the remediation using the reboot strategy.
 // Returns nil, nil when reconcile can continue.
 // Return a Result and optionally an error when reconcile should return.
@@ -328,20 +376,37 @@ func (r *Metal3RemediationReconciler) remediateRebootStrategy(ctx context.Contex
 			in corruption or other issues for applications with singleton requirement. After the host is powered
 			off we know for sure that it is safe to re-assign that workload to other nodes.
 		*/
-		modified := r.backupNode(remediationMgr, node)
-		if modified {
-			r.Log.Info("Backing up node")
-			// save annotations before deleting node
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+
+		if isOutOfServiceTaintSupported(r.Log) {
+			// add out-of-service taint to the node
+			if err := remediationMgr.AddOutOfServiceTaint(ctx, clusterClient, node); err != nil {
+				r.Log.Error(err, "error adding out-of-service taint to node")
+				return ctrl.Result{}, errors.Wrap(err, "error adding out-of-service taint to node")
+			}
+
+			// TODO: need to wait a little or the pod will look like not terminating
+			time.Sleep(3 * time.Second)
+			if !r.isResourceDeletionCompleted(ctx, clusterClient, node) {
+				// node not drained yet, wait a bit
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+		} else {
+			modified := r.backupNode(remediationMgr, node)
+			if modified {
+				r.Log.Info("Backing up node")
+				// save annotations before deleting node
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			}
+
+			r.Log.Info("Deleting node")
+			err := remediationMgr.DeleteNode(ctx, clusterClient, node)
+			if err != nil {
+				r.Log.Error(err, "error deleting node")
+				return ctrl.Result{}, errors.Wrap(err, "error deleting node")
+			}
+			// wait until node is gone
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		r.Log.Info("Deleting node")
-		err := remediationMgr.DeleteNode(ctx, clusterClient, node)
-		if err != nil {
-			r.Log.Error(err, "error deleting node")
-			return ctrl.Result{}, errors.Wrap(err, "error deleting node")
-		}
-		// wait until node is gone
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// we are done for this phase, switch to waiting for power on and the node restore
@@ -460,4 +525,40 @@ func (r *Metal3RemediationReconciler) SetupWithManager(_ context.Context, mgr ct
 		For(&infrav1.Metal3Remediation{}).
 		WithOptions(options).
 		Complete(r)
+}
+
+func (r *Metal3RemediationReconciler) isResourceDeletionCompleted(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) bool {
+	r.Log.Info("IS RESOURCE DELETION COMPLETED", "Node", node.Name)
+
+	pods, err := clusterClient.Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		r.Log.Error(err, "failed to get pod list in default namespace")
+		return false
+	}
+
+	r.Log.Info("Listing pods", "count", len(pods.Items))
+	for _, pod := range pods.Items {
+		r.Log.Info("Pod", "Name", pod.Name, "Node", pod.Spec.NodeName)
+		if pod.Spec.NodeName == node.Name {
+			if pod.ObjectMeta.DeletionTimestamp != nil {
+				r.Log.Info("WAIT TERMINATING POD", "pod name", pod.Name, "phase", pod.Status.Phase, "DeletionTimeStamp", pod.ObjectMeta.DeletionTimestamp)
+				return false
+			}
+		}
+	}
+
+	volumeAttachments := &storagev1.VolumeAttachmentList{}
+	if err := r.Client.List(ctx, volumeAttachments); err != nil {
+		r.Log.Error(err, "failed to get volumeAttachments list")
+		return false
+	}
+	for _, va := range volumeAttachments.Items {
+		if va.Spec.NodeName == node.Name {
+			r.Log.Info("waiting for deleting volumeAttachement", "name", va.Name)
+			return false
+		}
+	}
+
+	r.Log.Info("volume and pods clean")
+	return true
 }

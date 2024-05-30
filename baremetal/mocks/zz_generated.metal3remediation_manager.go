@@ -60,6 +60,20 @@ func (m *MockRemediationManagerInterface) EXPECT() *MockRemediationManagerInterf
 	return m.recorder
 }
 
+// AddOutOfServiceTaint mocks base method.
+func (m *MockRemediationManagerInterface) AddOutOfServiceTaint(ctx context.Context, clusterClient v11.CoreV1Interface, node *v1.Node) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AddOutOfServiceTaint", ctx, clusterClient, node)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// AddOutOfServiceTaint indicates an expected call of AddOutOfServiceTaint.
+func (mr *MockRemediationManagerInterfaceMockRecorder) AddOutOfServiceTaint(ctx, clusterClient, node interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddOutOfServiceTaint", reflect.TypeOf((*MockRemediationManagerInterface)(nil).AddOutOfServiceTaint), ctx, clusterClient, node)
+}
+
 // DeleteNode mocks base method.
 func (m *MockRemediationManagerInterface) DeleteNode(ctx context.Context, clusterClient v11.CoreV1Interface, node *v1.Node) error {
 	m.ctrl.T.Helper()
@@ -300,6 +314,20 @@ func (m *MockRemediationManagerInterface) RemoveNodeBackupAnnotations() {
 func (mr *MockRemediationManagerInterfaceMockRecorder) RemoveNodeBackupAnnotations() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RemoveNodeBackupAnnotations", reflect.TypeOf((*MockRemediationManagerInterface)(nil).RemoveNodeBackupAnnotations))
+}
+
+// RemoveOutOfServiceTaint mocks base method.
+func (m *MockRemediationManagerInterface) RemoveOutOfServiceTaint(ctx context.Context, clusterClient v11.CoreV1Interface, node *v1.Node) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RemoveOutOfServiceTaint", ctx, clusterClient, node)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RemoveOutOfServiceTaint indicates an expected call of RemoveOutOfServiceTaint.
+func (mr *MockRemediationManagerInterfaceMockRecorder) RemoveOutOfServiceTaint(ctx, clusterClient, node interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RemoveOutOfServiceTaint", reflect.TypeOf((*MockRemediationManagerInterface)(nil).RemoveOutOfServiceTaint), ctx, clusterClient, node)
 }
 
 // RemovePowerOffAnnotation mocks base method.

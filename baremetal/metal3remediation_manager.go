@@ -72,6 +72,8 @@ type RemediationManagerInterface interface {
 	GetNode(ctx context.Context, clusterClient v1.CoreV1Interface) (*corev1.Node, error)
 	UpdateNode(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) error
 	DeleteNode(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) error
+	AddOutOfServiceTaint(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) error
+	RemoveOutOfServiceTaint(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) error
 	GetClusterClient(ctx context.Context) (v1.CoreV1Interface, error)
 	SetNodeBackupAnnotations(annotations string, labels string) bool
 	GetNodeBackupAnnotations() (annotations, labels string)
@@ -86,6 +88,12 @@ type RemediationManager struct {
 	Metal3Machine     *infrav1.Metal3Machine
 	Machine           *clusterv1.Machine
 	Log               logr.Logger
+}
+
+var outOfServiceTaint = &corev1.Taint{
+	Key:    "node.kubernetes.io/out-of-service",
+	Value:  "nodeshutdown",
+	Effect: corev1.TaintEffectNoExecute,
 }
 
 // enforce implementation of interface.
@@ -475,4 +483,53 @@ func (r *RemediationManager) RemoveNodeBackupAnnotations() {
 // getPowerOffAnnotationKey returns the key of the power off annotation.
 func (r *RemediationManager) getPowerOffAnnotationKey() string {
 	return fmt.Sprintf(powerOffAnnotation, r.Metal3Remediation.UID)
+}
+
+func (r *RemediationManager) AddOutOfServiceTaint(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) error {
+	// check if out-of-service taint exists already
+	for _, taint := range node.Spec.Taints {
+		if taint.MatchTaint(outOfServiceTaint) {
+			r.Log.Info("out-of-service taint already exists")
+			return nil
+		}
+	}
+
+	taint := *outOfServiceTaint
+	now := metav1.Now()
+	taint.TimeAdded = &now
+	node.Spec.Taints = append(node.Spec.Taints, taint)
+	if err := r.UpdateNode(ctx, clusterClient, node); err != nil {
+		r.Log.Error(err, "Failed to add out-of-service taint on node", "node name", node.Name)
+		return err
+	}
+	r.Log.Info("out-of-service taint added", "new taints", node.Spec.Taints)
+	return nil
+}
+
+func (r *RemediationManager) RemoveOutOfServiceTaint(ctx context.Context, clusterClient v1.CoreV1Interface, node *corev1.Node) error {
+	var newTaints []corev1.Taint
+	var IsPopOutOfServiceTaintServiceTaint bool
+	for _, taint := range node.Spec.Taints {
+		if taint.MatchTaint(outOfServiceTaint) {
+			r.Log.Info("out-of-service taint found")
+			IsPopOutOfServiceTaintServiceTaint = true
+			continue
+		}
+		newTaints = append(newTaints, taint)
+	}
+	if IsPopOutOfServiceTaintServiceTaint {
+		r.Log.Info("REMOVE OOST from Taints")
+		node.Spec.Taints = newTaints
+	} else {
+		r.Log.Info("OOST NOT FOUND. NOTHING TO DO", "node name", node.Name)
+		return nil
+	}
+
+	if err := r.UpdateNode(ctx, clusterClient, node); err != nil {
+		r.Log.Error(err, "Failed to remove taint from node,", "node name", node.Name, "taint key", outOfServiceTaint.Key, "taint effect", outOfServiceTaint.Effect)
+		return err
+	}
+
+	r.Log.Info("out-of-service taint removed", "new taints", node.Spec.Taints)
+	return nil
 }
